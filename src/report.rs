@@ -67,6 +67,20 @@ pub fn plan_pretty(p: &Plan) -> String {
                 }
                 s.push_str("  rustopt does not edit files: copy the block above yourself\n");
             }
+            // Size and build time pull in opposite directions. `plan` measured both,
+            // so report the price next to the saving instead of leaving it invisible.
+            match (rec.default_build_ms, rec.price_ratio_vs_default) {
+                (Some(d), Some(r)) => s.push_str(&format!(
+                    "  price   {:.1}s build vs default {:.1}s  ({:.2}x wall time)\n",
+                    rec.build_ms as f64 / 1000.0,
+                    d as f64 / 1000.0,
+                    r
+                )),
+                _ => s.push_str(&format!(
+                    "  price   {:.1}s build (no `default` variant measured to compare against)\n",
+                    rec.build_ms as f64 / 1000.0
+                )),
+            }
         }
         None => s.push_str("RECOMMENDATION  none (no variant produced a measurement)\n"),
     }

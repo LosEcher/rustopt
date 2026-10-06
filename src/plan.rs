@@ -42,6 +42,19 @@ pub struct Recommendation {
     pub profile: BTreeMap<String, String>,
     /// Always `false` here: `plan` never edits the package.
     pub applied: bool,
+    /// Build wall time of the recommended variant, in milliseconds.
+    ///
+    /// Size and build time pull in opposite directions, so a recommendation that
+    /// only reports bytes is half a recommendation: the knobs that win the size
+    /// contest are usually the ones that cost the most time. `plan` already
+    /// measures every variant's build, so the price is reported rather than left
+    /// for the user to discover.
+    pub build_ms: u64,
+    /// Build wall time of the `default` variant, when it was measured.
+    pub default_build_ms: Option<u64>,
+    /// `build_ms / default_build_ms` — how many times slower than cargo's default
+    /// profile the recommendation is.
+    pub price_ratio_vs_default: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,18 +247,35 @@ pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
             best = Some((v, b));
         }
     }
-    let recommendation = best.map(|(v, b)| Recommendation {
-        variant: v.name.to_string(),
-        bytes: b,
-        vs_default_bytes: default_bytes.map(|d| b as i64 - d as i64),
-        vs_default_pct: default_bytes.and_then(|d| crate::budget::pct_delta(d, b)),
-        vs_current_bytes: current_bytes.map(|c| b as i64 - c as i64),
-        vs_current_pct: current_bytes.and_then(|c| crate::budget::pct_delta(c, b)),
-        profile: variants::manifest_knobs(v)
+    let default_build_ms = measured
+        .iter()
+        .find(|(v, _)| v.name == "default")
+        .map(|(_, o)| o.duration_ms);
+    let recommendation = best.map(|(v, b)| {
+        let build_ms = measured
             .iter()
-            .map(|(k, val)| ((*k).to_string(), (*val).to_string()))
-            .collect(),
-        applied: false,
+            .find(|(mv, _)| mv.name == v.name)
+            .map(|(_, o)| o.duration_ms)
+            .unwrap_or(0);
+        Recommendation {
+            variant: v.name.to_string(),
+            bytes: b,
+            vs_default_bytes: default_bytes.map(|d| b as i64 - d as i64),
+            vs_default_pct: default_bytes.and_then(|d| crate::budget::pct_delta(d, b)),
+            vs_current_bytes: current_bytes.map(|c| b as i64 - c as i64),
+            vs_current_pct: current_bytes.and_then(|c| crate::budget::pct_delta(c, b)),
+            profile: variants::manifest_knobs(v)
+                .iter()
+                .map(|(k, val)| ((*k).to_string(), (*val).to_string()))
+                .collect(),
+            applied: false,
+            build_ms,
+            default_build_ms,
+            price_ratio_vs_default: match default_build_ms {
+                Some(d) if d > 0 => Some(build_ms as f64 / d as f64),
+                _ => None,
+            },
+        }
     });
 
     let mut notes = Vec::new();

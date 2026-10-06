@@ -182,6 +182,21 @@ fn measured_plan_matches_the_reference_and_finds_a_smaller_variant() {
         "plan must never claim to have edited files"
     );
     assert!(rec["profile"]["lto"].as_str().unwrap().contains("fat"));
+
+    // Size and build time pull in opposite directions, so the recommendation reports
+    // the price of its own advice. The recommended variant was built, so its own time
+    // is always there; the ratio needs a usable `default` baseline (a no-op build can
+    // legitimately measure 0 ms).
+    assert!(
+        rec["build_ms"].as_u64().unwrap() > 0,
+        "the recommended variant's build time must be reported: {rec}"
+    );
+    if rec["default_build_ms"].as_u64().unwrap_or(0) > 0 {
+        let ratio = rec["price_ratio_vs_default"]
+            .as_f64()
+            .expect("a measured default build must yield a price ratio");
+        assert!(ratio > 0.0, "ratio must be positive, got {ratio}");
+    }
 }
 
 #[test]
