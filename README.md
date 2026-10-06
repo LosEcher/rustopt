@@ -10,12 +10,18 @@ recommended, and then acts as a gate:
 
 ```
 $ rustopt plan --manifest .
+rustopt 0.1.0 - plan (run-1791296836526-0)
+package   tiny 0.1.0
+manifest  /tmp/rustopt-fixture-tiny.cSRJG4
+toolchain rustc 1.97.0 / aarch64-apple-darwin
+verdict   OK
+
 VARIANT   STATUS   BYTES                    VS DEFAULT  VS CURRENT  BUILD
-current   ok       431.23 KB (431232 bytes) -0.0%       +0.0%       0.3s
-default   ok       431.30 KB (431296 bytes) +0.0%       +0.0%       0.2s
+current   ok       431.23 KB (431232 bytes) -0.0%       -           0.5s
+default   ok       431.30 KB (431296 bytes) -           +0.0%       0.2s
 z         ok       431.38 KB (431376 bytes) +0.0%       +0.0%       0.2s
-lto       ok       373.07 KB (373072 bytes) -13.5%      -13.5%      2.5s
-tuned     ok       286.11 KB (286112 bytes) -33.7%      -33.7%      2.2s
+lto       ok       373.07 KB (373072 bytes) -13.5%      -13.5%      2.3s
+tuned     ok       286.11 KB (286112 bytes) -33.7%      -33.7%      2.1s
 
 RECOMMENDATION  tuned -> 286.11 KB (286112 bytes)  (-33.7% vs cargo defaults, -33.7% vs current)
   [profile.release]
@@ -28,6 +34,7 @@ RECOMMENDATION  tuned -> 286.11 KB (286112 bytes)  (-33.7% vs cargo defaults, -3
 NOTES
   - trap: opt-level="z" on its own is 80 bytes LARGER than cargo's default (+0.0%). Single-knob comparisons mislead; only a measured combination counts.
   - lto="fat" + codegen-units=1 alone: 431.30 KB (431296 bytes) -> 373.07 KB (373072 bytes) (-13.5%)
+  - current configuration 431.23 KB (431232 bytes) -> recommended 286.11 KB (286112 bytes) (-33.7%)
 ```
 
 ## Why measure instead of estimate
@@ -57,7 +64,7 @@ before recommending anything:
 | `cdylib` — `crate-type = ["cdylib"]` / `["staticlib"]` | `ban` | same: panics must unwind across FFI |
 | `abort-conflict` — the manifest already sets `panic = "abort"` **and** the source catches panics | `error` | reported as a pre-existing defect, not as advice |
 | `should-panic` — `#[should_panic]` tests | `warn` | panic strategy is observable in tests |
-| `backtrace-use` — `Backtrace` / `RUST_BACKTRACE` | `warn` | `strip = "symbols"` degrades symbolization |
+| `backtrace-use` — the source refers to `Backtrace` / `backtrace::` | `warn` | `strip = "symbols"` degrades symbolization |
 | `no-cargo-lock` — no `Cargo.lock` | `warn` | a build may write a lockfile into your tree |
 
 Evidence is computed on **code only**: comments, string literals and raw strings are
@@ -67,14 +74,26 @@ that points at a comment, or at an identifier that merely contains the word, is 
 no finding at all. A test asserts this against rustopt's own source, which catches panics
 on purpose.
 
+The trade-off is recall: a marker that only ever appears *inside* a string (say
+`env::var("RUST_BACKTRACE")`) is not detected. Precision was chosen over recall for bans —
+a wrong `ban` silently removes a real option.
+
 `panic = "abort"` is never in the default variant set: it changes crash behaviour from
 unwinding (exit 101) to SIGABRT (exit 134), and exit codes are part of a CLI's contract.
 If you want to measure it anyway, ask for it: `--variants tuned,abort`.
 
 ## Install
 
+Not on crates.io yet — install from git:
+
 ```sh
-cargo install rustopt
+cargo install --git https://github.com/LosEcher/rustopt --locked
+```
+
+or build it in place:
+
+```sh
+cargo build --release --manifest-path path/to/rustopt/Cargo.toml
 ```
 
 ## Usage
@@ -99,7 +118,7 @@ with `--budget`; sizes accept `1500000`, `1.5MB` (1000-based) or `2MiB` (1024-ba
 ### Gate a release in CI
 
 ```yaml
-- run: cargo install rustopt --locked
+- run: cargo install --git https://github.com/LosEcher/rustopt --locked
 - run: rustopt check --manifest . --budget 2.5MB --no-log
 ```
 
