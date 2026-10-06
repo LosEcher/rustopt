@@ -8,10 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pin the toolchain: `@stable` means a new upstream clippy lint can turn main red
-  # on a day nobody changed anything (and then local runs cannot reproduce it).
-  # Bump this together with `rust-version` in Cargo.toml, in one commit.
-  TOOLCHAIN: "1.97.0"
 
 jobs:
   test:
@@ -25,7 +21,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          # Pinned, not @stable: a new upstream clippy lint can turn main red on a day
+          # nobody changed anything, and then local runs cannot reproduce it.
+          # Bump the two pinned versions here together with `rust-version` in Cargo.toml.
+          # (Written literally: an `env:` indirection did not reach the action input
+          # on the Windows runner.)
+          toolchain: "1.97.0"
           components: rustfmt, clippy
       - name: Format check
         if: matrix.os == 'ubuntu-latest'
@@ -81,7 +82,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: "1.97.0"
           targets: ${{ matrix.target }}
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}

@@ -223,7 +223,7 @@ fn first_hit(repo: &Path, files: &[PathBuf], markers: &[&str]) -> Option<(String
                 total += 1;
                 if first.is_none() {
                     let rel = f.strip_prefix(repo).unwrap_or(f);
-                    first = Some((format!("{}:{}", rel.display(), i + 1), 0));
+                    first = Some((format!("{}:{}", slash_path(rel), i + 1), 0));
                 }
             }
         }
@@ -351,6 +351,22 @@ fn strip_noncode(src: &str) -> String {
         }
         out.push(c);
         i += 1;
+    }
+    out
+}
+
+/// Render a path with `/` separators on every platform.
+///
+/// Evidence has to read the same everywhere: a Windows run reporting
+/// `src\main.rs:7` is not parseable by the same scripts as `src/main.rs:7`, and it
+/// makes reports machine-dependent for no benefit.
+fn slash_path(p: &Path) -> String {
+    let mut out = String::new();
+    for (i, c) in p.components().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&c.as_os_str().to_string_lossy());
     }
     out
 }
@@ -542,6 +558,18 @@ mod tests {
             "an identifier that merely contains the word is not a call site"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn evidence_paths_always_use_forward_slashes() {
+        // Windows used to leak `src\main.rs` into evidence, which broke every
+        // assertion written against `src/main.rs` and made reports platform-shaped.
+        let p = Path::new("src").join("main.rs");
+        assert_eq!(slash_path(&p), "src/main.rs");
+        assert_eq!(
+            slash_path(&Path::new("a").join("b").join("c.rs")),
+            "a/b/c.rs"
+        );
     }
 
     #[test]
