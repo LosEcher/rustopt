@@ -1,0 +1,8 @@
+[package]
+name = "tiny"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace root so this fixture is never absorbed by a parent package.
+[workspace]
