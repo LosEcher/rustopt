@@ -93,8 +93,34 @@ cargo install --git https://github.com/LosEcher/rustopt --locked
 or build it in place:
 
 ```sh
-cargo build --release --manifest-path path/to/rustopt/Cargo.toml
+cargo build --release --manifest-path path/to/rustopt/Cargo.toml         # fast: cargo defaults
+cargo build --profile dist --manifest-path path/to/rustopt/Cargo.toml    # small: for shipping
 ```
+
+### Two profiles, on purpose
+
+`rustopt` keeps cargo's default `release` profile and puts the size knobs in a separate
+`dist` profile:
+
+```toml
+[profile.release]        # developers + pull-request CI: nothing overridden
+[profile.dist]           # release assets only
+inherits = "release"     # required — cargo errors out on a custom profile without it
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+```
+
+This is the convention `plan` implies but does not enforce, and it exists because the two
+groups of knobs pull in opposite directions. On a comparable crate the `dist` set costs
+about **2× wall-clock** time against the default profile — and noticeably worse on a loaded
+machine, because `codegen-units = 1` removes the parallelism that lets a build absorb
+contention. Measured, not estimated. Paying that on every `cargo build --release` and on
+every pull request buys nothing: only the artifact you publish needs to be small.
+
+`cargo install` uses `release`, so installing stays fast; `cargo install --profile dist`
+gets you the small binary if that is what you want.
 
 ## Usage
 

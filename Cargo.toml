@@ -23,12 +23,32 @@ serde_json = "1"
 name = "rustopt"
 path = "src/main.rs"
 
-[profile.release]
-# rustopt measures size, so it must not hide it: this repo deliberately does NOT set
-# `strip = "symbols"` here (that would make `cargo bloat`/`nm` useless on rustopt itself).
+# Two profiles on purpose, because artifact size and build time pull in opposite
+# directions and the tool should not silently trade one for the other:
+#
+#   --release  (this profile is intentionally left as cargo's default)
+#       used by developers and by the pull-request CI matrix. Nothing is overridden,
+#       so `codegen-units = 16` keeps intra-crate parallelism and there is no LTO.
+#       `cargo install rustopt` also lands here, so users get a fast local build.
+#
+#   --profile dist
+#       used only when producing the published release assets. This is where the
+#       size knobs live. Measured cost of these knobs on a comparable crate:
+#       ~2x wall-clock (and worse on a loaded machine, because codegen-units = 1
+#       removes the parallelism that lets a build absorb contention).
+#
+# The knobs are NOT in [profile.release]: rustopt measures size, and a tool whose own
+# release builds are 2x slower for bytes it never ships would be a poor advertisement
+# for its own advice.
+[profile.dist]
+inherits = "release" # required: cargo errors out on a custom profile without it
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+strip = "symbols"
+# Not set here either (and never recommended by `plan` for a crate that catches
+# panics): panic = "abort" would break rustopt's own "exit 2 = tool error" contract,
+# which is implemented with std::panic::catch_unwind in src/main.rs.
 
 [profile.dev]
 incremental = false

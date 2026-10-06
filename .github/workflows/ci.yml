@@ -36,6 +36,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked
+      - name: Packaging profile smoke build
+        # The release job only runs on tags, so without this a broken `dist` profile
+        # would only be discovered while trying to publish. One platform is enough.
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --locked --profile dist
       - name: Test
         # tests/cli.rs builds the fixture packages for real, so this also exercises
         # every documented exit code.
@@ -85,7 +90,10 @@ jobs:
           toolchain: "1.97.0"
           targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        # Shipped assets come from the `dist` profile (size knobs). The test matrix
+        # above keeps plain `--release`, which stays fast because it is cargo's
+        # default profile: only the tag-time packaging job pays for LTO.
+        run: cargo build --locked --profile dist --target ${{ matrix.target }}
       - name: Stage asset
         shell: bash
         run: |
@@ -93,7 +101,7 @@ jobs:
           ext=""
           case "${{ matrix.target }}" in *windows*) ext=".exe";; esac
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/rustopt${ext}" "dist/${{ matrix.asset }}${ext}"
+          cp "target/${{ matrix.target }}/dist/rustopt${ext}" "dist/${{ matrix.asset }}${ext}"
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
