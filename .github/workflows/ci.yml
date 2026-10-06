@@ -28,6 +28,12 @@ jobs:
           # on the Windows runner.)
           toolchain: "1.97.0"
           components: rustfmt, clippy
+      # This job builds three dependency trees per platform (default, clippy, then
+      # `--profile dist`), so without a cache every run pays for all of them.
+      # Baseline before this commit: ubuntu 81s / macos 54s / windows 116s.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Format check
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
@@ -54,6 +60,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.87.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Check against the declared rust-version
         run: |
           declared=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
@@ -89,6 +98,12 @@ jobs:
         with:
           toolchain: "1.97.0"
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # `--target <triple>` writes under target/<triple>, so the key must include
+          # the triple or the three rows would share a single entry.
+          key: ${{ matrix.target }}
       - name: Build
         # Shipped assets come from the `dist` profile (size knobs). The test matrix
         # above keeps plain `--release`, which stays fast because it is cargo's
