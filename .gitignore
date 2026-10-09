@@ -1,4 +1,5 @@
 /target
 /.rustopt
+/.fmtguard
 .DS_Store
 *.log

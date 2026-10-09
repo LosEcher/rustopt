@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::events::{self, Event};
 use crate::guard::{self, Finding};
-use crate::measure::{self, BuildOpts, Outcome, TargetSize};
+use crate::measure::{self, BuildOpts, Outcome, ProfileSite, TargetSize};
 use crate::variants::{self, Variant};
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +69,10 @@ pub struct Plan {
     pub host: String,
     /// Cargo profile this plan ablated (`release` unless `--build-profile`).
     pub build_profile: String,
+    /// The manifest the recommended keys must be written into. Cargo reads
+    /// profiles only from the workspace root, so a recommendation that names
+    /// only the keys can be applied to a manifest where it does nothing.
+    pub profile_site: ProfileSite,
     pub variants: Vec<VariantResult>,
     pub findings: Vec<Finding>,
     pub rejected: Vec<Rejected>,
@@ -90,6 +94,8 @@ pub struct CheckReport {
     pub host: String,
     /// Cargo profile that was measured (`release` unless `--build-profile`).
     pub build_profile: String,
+    /// Where `[profile.*]` for this package actually has to be written.
+    pub profile_site: ProfileSite,
     pub variant: String,
     pub command: String,
     pub stderr_hash: String,
@@ -141,7 +147,21 @@ pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
         ));
     }
     let tc = tc.map_err(|_| "internal panic in rustc probe".to_string())??;
-    let findings = findings.map_err(|_| "internal panic in guard scan".to_string())??;
+    let mut findings = findings.map_err(|_| "internal panic in guard scan".to_string())??;
+    // The recommendation is a set of keys; where they must be written is part of
+    // the recommendation, because cargo ignores a `[profile.*]` declared in a
+    // workspace member. Reported through `findings` (so it reaches the ledger)
+    // rather than only through the `profile_site` field.
+    let profile_site = meta.profile_site(opts.build.profile_name());
+    if let Some(w) = &profile_site.warning {
+        findings.push(guard::Finding {
+            id: "profile-site".to_string(),
+            severity: "warn".to_string(),
+            evidence: "Cargo.toml".to_string(),
+            message: w.clone(),
+            occurrences: 1,
+        });
+    }
     let banned = guard::banned_knobs(&findings);
 
     log_to(
@@ -369,6 +389,7 @@ pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
         rustc: tc.rustc,
         host: tc.host,
         build_profile: opts.build.profile_name().to_string(),
+        profile_site,
         variants: results,
         findings,
         rejected,
@@ -461,6 +482,10 @@ pub fn check(repo: &Path, opts: &PlanOpts, budget_bytes: u64) -> Result<CheckRep
     };
 
     let mut notes = Vec::new();
+    let profile_site = meta.profile_site(opts.build.profile_name());
+    if let Some(w) = &profile_site.warning {
+        notes.push(w.clone());
+    }
     if verdict == "fail" {
         notes.push(
             "run `rustopt plan` to see which measured variant would fit and what it costs"
@@ -478,6 +503,7 @@ pub fn check(repo: &Path, opts: &PlanOpts, budget_bytes: u64) -> Result<CheckRep
         rustc: tc.rustc,
         host: tc.host,
         build_profile: opts.build.profile_name().to_string(),
+        profile_site,
         variant: current.name.to_string(),
         command: outcome.command.clone(),
         stderr_hash: outcome.stderr_hash.clone(),

@@ -495,3 +495,152 @@ fn plan_reports_the_profile_it_ablated() {
         "a dist plan must not write release overrides: {cmd}"
     );
 }
+
+/// A two-package workspace: a virtual root plus one member package. This is the
+/// layout where a `[profile.*]` recommendation can be written somewhere inert,
+/// because cargo reads profiles only from the workspace root manifest.
+fn workspace_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let root = scratch(&format!("{tag}-ws"));
+    let member = root.join("member");
+    std::fs::create_dir_all(member.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    // The member declares the very knob a plan would recommend, in the place
+    // cargo ignores.
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"ws-member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [profile.release]\nstrip = \"symbols\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("src/main.rs"),
+        "fn main() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+    (root, member)
+}
+
+#[test]
+fn a_workspace_member_is_told_where_the_profile_must_be_written() {
+    let (root, member) = workspace_fixture("profile-site");
+    let work = scratch("profile-site-work");
+
+    let v = json(&[
+        "plan",
+        "--manifest",
+        member.to_str().unwrap(),
+        "--work-dir",
+        work.to_str().unwrap(),
+        "--dry-run",
+        "--no-log",
+        "--emit",
+        "json",
+    ]);
+
+    assert_eq!(
+        v["profile_site"]["is_workspace_root"], false,
+        "a member package is not the workspace root: {v}"
+    );
+    let effective = v["profile_site"]["effective_manifest"].as_str().unwrap();
+    assert_eq!(
+        std::fs::canonicalize(effective).unwrap(),
+        std::fs::canonicalize(root.join("Cargo.toml")).unwrap(),
+        "the recommendation must name the workspace root manifest, not the member"
+    );
+
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "profile-site")
+        .unwrap_or_else(|| panic!("a member package must carry a profile-site warning: {v}"));
+    assert_eq!(finding["severity"], "warn");
+    let message = finding["message"].as_str().unwrap();
+    assert!(
+        message.contains("workspace root manifest"),
+        "the warning must say why the site matters: {message}"
+    );
+}
+
+#[test]
+fn a_standalone_package_gets_no_profile_site_warning() {
+    // Negative control for the test above: the warning is about the layout, so a
+    // package that *is* its own workspace root must stay quiet. Without this arm
+    // an always-warn implementation would pass.
+    let dir = fixture("profile-site-solo", "tiny");
+    let work = scratch("profile-site-solo-work");
+
+    let v = json(&[
+        "plan",
+        "--manifest",
+        dir.to_str().unwrap(),
+        "--work-dir",
+        work.to_str().unwrap(),
+        "--dry-run",
+        "--no-log",
+        "--emit",
+        "json",
+    ]);
+
+    assert_eq!(v["profile_site"]["is_workspace_root"], true, "{v}");
+    assert!(
+        v["profile_site"]["warning"].is_null(),
+        "a standalone package needs no site warning: {v}"
+    );
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "profile-site"),
+        "a standalone package must not report profile-site: {v}"
+    );
+}
+
+/// Pins the cargo rule the `profile-site` finding rests on, from cargo's own
+/// output rather than from documentation. If a future cargo starts honouring a
+/// member's `[profile.*]`, this goes red and the finding must be reworded — not
+/// silently kept.
+#[test]
+fn cargo_ignores_a_profile_declared_in_a_workspace_member() {
+    let (root, _member) = workspace_fixture("cargo-rule");
+    let manifest = root.join("Cargo.toml");
+    let build = |extra: &[&str]| -> String {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+            .arg("--release")
+            .arg("-v")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(&manifest);
+        for e in extra {
+            cmd.arg(e);
+        }
+        let out = cmd.output().expect("failed to spawn cargo");
+        // Verbose cargo writes the rustc invocation to stderr.
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    let member_declared = build(&[]);
+    assert!(
+        member_declared.contains("profiles for the non root package will be ignored"),
+        "cargo's own warning is the observable this finding is about:\n{member_declared}"
+    );
+    assert!(
+        !member_declared.contains("-C strip=symbols"),
+        "cargo ignored the member's profile (as this finding claims), so the flag must be \
+         absent; if cargo honours it now, the finding is wrong:\n{member_declared}"
+    );
+
+    // The form rustopt itself uses must take effect, otherwise a measurement
+    // would be of the wrong configuration.
+    let via_config = build(&["--config", "profile.release.strip=\"symbols\""]);
+    assert!(
+        via_config.contains("-C strip=symbols"),
+        "`--config` must apply the override that a member manifest cannot:\n{via_config}"
+    );
+}

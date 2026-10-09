@@ -76,6 +76,66 @@ pub struct PkgMeta {
     pub version: String,
     pub manifest_path: String,
     pub bin_targets: Vec<String>,
+    /// `cargo metadata`'s `workspace_root` (a directory). Empty when unknown.
+    pub workspace_root: String,
+    /// True when this package's manifest *is* the workspace root manifest, and
+    /// therefore the only place cargo reads `[profile.*]` from. Defaults to
+    /// `true` when the layout cannot be resolved, so an unresolvable case never
+    /// produces a false alarm.
+    pub is_workspace_root: bool,
+}
+
+/// Where `[profile.<name>]` actually has to be written.
+///
+/// Cargo reads profiles **only** from the workspace root manifest. A profile
+/// declared in a member package is ignored — at build time cargo prints
+/// `warning: profiles for the non root package will be ignored`, and the
+/// resulting artifact keeps cargo's default (`-C strip=debuginfo`, not the
+/// `strip=symbols` the member asked for). `rustopt`'s own measurements are
+/// unaffected because variants are applied with `cargo --config`, which always
+/// takes effect; what breaks is *copying the recommendation into the wrong
+/// manifest*, so the recommendation names the file, not only the keys.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileSite {
+    pub package_manifest: String,
+    pub effective_manifest: String,
+    pub is_workspace_root: bool,
+    /// Present only when the package is not the workspace root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl PkgMeta {
+    /// The manifest a recommendation for `profile` must be written into.
+    #[must_use]
+    pub fn profile_site(&self, profile: &str) -> ProfileSite {
+        let effective_manifest = if self.workspace_root.is_empty() {
+            self.manifest_path.clone()
+        } else {
+            Path::new(&self.workspace_root)
+                .join("Cargo.toml")
+                .display()
+                .to_string()
+        };
+        let warning = if self.is_workspace_root {
+            None
+        } else {
+            Some(format!(
+                "write [profile.{profile}] in {effective_manifest}, not in {}: cargo reads \
+                 profiles only from the workspace root manifest and ignores (with a build-time \
+                 warning) a profile declared in a member. Measured variants are unaffected — \
+                 rustopt applies overrides with `cargo --config`, which always takes effect — \
+                 but keys copied from `profile` into the member manifest are inert.",
+                self.manifest_path
+            ))
+        };
+        ProfileSite {
+            package_manifest: self.manifest_path.clone(),
+            effective_manifest,
+            is_workspace_root: self.is_workspace_root,
+            warning,
+        }
+    }
 }
 
 /// `cargo build --release --message-format=json` argv for one variant.
@@ -389,6 +449,23 @@ pub fn package_meta(repo: &Path, offline: bool) -> Result<PkgMeta, String> {
         .unwrap_or("")
         .to_string();
 
+    // Where cargo actually reads `[profile.*]` from. `cargo metadata` reports
+    // both, so this is cargo's own view rather than a directory guess. When
+    // either path cannot be resolved we assume "root" and stay quiet: a warning
+    // that fires on a layout we failed to read would be worse than no warning.
+    let workspace_root = v
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let is_workspace_root = match (
+        Path::new(&manifest_path).parent(),
+        std::fs::canonicalize(&workspace_root),
+    ) {
+        (Some(dir), Ok(root)) => std::fs::canonicalize(dir).map_or(true, |d| d == root),
+        _ => true,
+    };
+
     let mut bins = Vec::new();
     if let Some(targets) = p.get("targets").and_then(serde_json::Value::as_array) {
         for t in targets {
@@ -410,6 +487,8 @@ pub fn package_meta(repo: &Path, offline: bool) -> Result<PkgMeta, String> {
         version,
         manifest_path,
         bin_targets: bins,
+        workspace_root,
+        is_workspace_root,
     })
 }
 
