@@ -10,14 +10,6 @@ license = "MIT"
 repository = "https://github.com/LosEcher/rustopt"
 keywords = ["binary-size", "profile", "lto", "strip", "ci"]
 categories = ["development-tools", "command-line-utilities"]
-# This crate measures bytes, so its own published payload should not carry the
-# investigation log. `docs/` is 75% of the unpacked .crate (300 of 399 KiB) and
-# includes `docs/evidence/rollback/`, which holds other repositories' Cargo.toml
-# and Cargo.lock copies; `scripts/` is a fleet bootstrapping script and
-# `.github/` is not used by a downloaded crate. Measured: 49 files / 126.1 KiB
-# compressed -> 25 files / 41.2 KiB compressed with this line. `tests/` and its
-# fixtures stay, because the published crate is meant to be self-testing.
-exclude = ["docs/", "scripts/", ".github/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -60,10 +52,3 @@ strip = "symbols"
 
 [profile.dev]
 incremental = false
-
-[profile.dev.package."*"]
-# deps: no debuginfo (biggest dev-build disk lever; measured 372 -> 225 MB here).
-debug = 0
-# debug = 0 makes cargo pass `-C strip=debuginfo`; Apple strip can break proc-macro
-# dylibs (dlopen: mis-aligned LINKEDIT string pool). Free insurance, no size cost.
-strip = "none"

@@ -126,11 +126,12 @@ gets you the small binary if that is what you want.
 
 ```sh
 rustopt plan   [--manifest DIR] [--variants a,b,c] [--work-dir DIR] [--ephemeral]
-               [--dry-run] [--offline] [--jobs N] [--emit json|pretty]
-               [--log PATH | --no-log]
+               [--dry-run] [--offline] [--jobs N] [--build-profile NAME]
+               [--emit json|pretty] [--log PATH | --no-log]
 
 rustopt check  [--manifest DIR] --budget SIZE [--work-dir DIR] [--ephemeral]
-               [--offline] [--jobs N] [--emit json|pretty] [--log PATH | --no-log]
+               [--offline] [--jobs N] [--build-profile NAME]
+               [--emit json|pretty] [--log PATH | --no-log]
 
 rustopt ledger [--tail N] [--run ID] [--log PATH] [--emit json|pretty]
 
@@ -140,6 +141,10 @@ rustopt clean  [--repo DIR] [--work-dir DIR] [--apply] [--emit json|pretty]
 `plan` never edits your package: it prints the block to copy. `--dry-run` prints the exact
 cargo argv without building anything. `check` measures what you ship today and compares it
 with `--budget`; sizes accept `1500000`, `1.5MB` (1000-based) or `2MiB` (1024-based).
+
+`--build-profile NAME` measures `cargo build --profile NAME` instead of `--release`
+(the profile must be declared in your manifest). Use it whenever the thing you publish
+is not built from cargo's built-in `release`.
 
 ### Gate a release in CI
 
@@ -151,6 +156,14 @@ with `--budget`; sizes accept `1500000`, `1.5MB` (1000-based) or `2MiB` (1024-ba
 `check` exits `1` when the artifact is over budget and `2` when the tool itself could not
 measure (missing manifest, no bin target, failed build). A broken build therefore never
 looks like a passing gate.
+
+**Gate what you actually ship.** `check` measures `--release` by default, so a package
+that ships from a named profile — the two-profile convention below, for instance — would
+otherwise pass or fail on an artifact nobody uploads. Name the profile you publish from:
+
+```yaml
+- run: rustopt check --manifest . --build-profile dist --budget 600KB --no-log
+```
 
 ### Variants
 

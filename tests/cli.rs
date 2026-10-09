@@ -395,3 +395,103 @@ fn clean_previews_then_applies() {
     assert_eq!(applied.code, 0);
     assert!(!work.exists(), "--apply must remove the work dir");
 }
+
+#[test]
+fn check_can_gate_a_named_profile_instead_of_release() {
+    // The gate has to be able to measure what the package actually publishes: a
+    // crate that ships from `--profile dist` otherwise passes a release-sized
+    // budget while the artifact it uploads stays ungated.
+    let dir = fixture("namedprofile", "tiny");
+    let work = scratch("namedprofile-work");
+    let v = json(&[
+        "check",
+        "--manifest",
+        dir.to_str().unwrap(),
+        "--budget",
+        "10MB",
+        "--build-profile",
+        "dist",
+        "--work-dir",
+        work.to_str().unwrap(),
+        "--offline",
+        "--no-log",
+        "--emit",
+        "json",
+    ]);
+    let cmd = v["command"].as_str().unwrap();
+    assert!(cmd.contains("--profile dist"), "{cmd}");
+    assert!(!cmd.contains("--release"), "{cmd}");
+    assert_eq!(v["build_profile"], "dist");
+    assert_eq!(v["verdict"], "pass");
+    assert!(v["measured_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn an_unmeasurable_profile_is_a_tool_error_not_a_pass() {
+    // Fail closed: a profile cargo cannot build must exit 2, never 0/1.
+    let dir = fixture("badprofile", "tiny");
+    let r = run(&[
+        "check",
+        "--manifest",
+        dir.to_str().unwrap(),
+        "--budget",
+        "10MB",
+        "--build-profile",
+        "not-a-profile",
+        "--offline",
+        "--no-log",
+    ]);
+    assert_eq!(r.code, 2, "stdout was: {}", r.stdout);
+    assert!(!r.stdout.contains("PASS"), "{}", r.stdout);
+}
+
+#[test]
+fn a_profile_name_cannot_smuggle_config_syntax() {
+    let dir = fixture("badname", "tiny");
+    let r = run(&[
+        "check",
+        "--manifest",
+        dir.to_str().unwrap(),
+        "--budget",
+        "10MB",
+        "--build-profile",
+        "dist.opt-level=\"z\"",
+        "--no-log",
+    ]);
+    assert_eq!(r.code, 2, "stdout was: {}", r.stdout);
+    assert!(
+        r.stdout.is_empty(),
+        "a rejected profile name must not reach cargo: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn plan_reports_the_profile_it_ablated() {
+    let dir = fixture("plantprofile", "tiny");
+    let v = json(&[
+        "plan",
+        "--manifest",
+        dir.to_str().unwrap(),
+        "--build-profile",
+        "dist",
+        "--dry-run",
+        "--no-log",
+        "--emit",
+        "json",
+    ]);
+    assert_eq!(v["build_profile"], "dist");
+    let default = v["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["variant"] == "default")
+        .expect("default variant");
+    let cmd = default["command"].as_str().unwrap();
+    assert!(cmd.contains("--profile dist"), "{cmd}");
+    assert!(cmd.contains("profile.dist.opt-level=3"), "{cmd}");
+    assert!(
+        !cmd.contains("profile.release."),
+        "a dist plan must not write release overrides: {cmd}"
+    );
+}

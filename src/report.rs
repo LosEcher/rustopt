@@ -61,7 +61,7 @@ pub fn plan_pretty(p: &Plan) -> String {
             if rec.profile.is_empty() {
                 s.push_str("  (the current configuration already is the recommendation)\n");
             } else {
-                s.push_str("  [profile.release]\n");
+                s.push_str(&format!("  [profile.{}]\n", p.build_profile));
                 for (k, v) in &rec.profile {
                     s.push_str(&format!("  {k} = {v}\n"));
                 }
@@ -134,6 +134,10 @@ pub fn check_pretty(c: &CheckReport) -> String {
         "variant   {} (what the package ships today)\n",
         c.variant
     ));
+    // Say which profile was measured: a gate that silently measured the wrong
+    // artifact is worse than no gate, and `--build-profile` exists because cargo's
+    // `release` is not always what a package publishes.
+    s.push_str(&format!("profile   {}\n", c.build_profile));
     s.push_str(&format!("command   {}\n", c.command));
     s.push_str(&format!(
         "measured  {}  across {} target(s)\n",

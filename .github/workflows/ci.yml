@@ -47,6 +47,20 @@ jobs:
         # would only be discovered while trying to publish. One platform is enough.
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --locked --profile dist
+      - name: Packaging content gate
+        # `Cargo.toml` excludes docs/, scripts/ and .github/ because a crate that
+        # measures bytes should not ship 300 KiB of investigation log (and other
+        # repos' lockfiles). This gate is what keeps that line honest.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          cargo package --list --allow-dirty > /tmp/pkg-list.txt
+          if grep -q '^docs/' /tmp/pkg-list.txt; then
+            echo "::error::docs/ must not ship in the .crate:"
+            grep '^docs/' /tmp/pkg-list.txt
+            exit 1
+          fi
+          echo "packaged $(wc -l < /tmp/pkg-list.txt) files, no docs/"
       - name: Test
         # tests/cli.rs builds the fixture packages for real, so this also exercises
         # every documented exit code.

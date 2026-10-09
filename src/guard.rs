@@ -58,7 +58,19 @@ pub fn scan(repo: &Path) -> Result<Vec<Finding>, String> {
 
     let mut out = Vec::new();
 
-    let catch = first_hit(repo, &rs_files, CATCH_UNWIND_NEEDLES);
+    // One pass for every marker group. The previous shape ran a whole separate
+    // scan (walk the file list, read, strip, match) per group, so every source
+    // file was read and stripped three times.
+    let groups: [&[&str]; 3] = [
+        CATCH_UNWIND_NEEDLES,
+        SHOULD_PANIC_NEEDLES,
+        BACKTRACE_NEEDLES,
+    ];
+    let mut hits = scan_markers(repo, &rs_files, &groups);
+    let catch = hits.remove(0);
+    let should_panic = hits.remove(0);
+    let backtrace = hits.remove(0);
+
     let cdylib = manifest
         .as_deref()
         .and_then(manifest_crate_type)
@@ -110,7 +122,7 @@ pub fn scan(repo: &Path) -> Result<Vec<Finding>, String> {
         });
     }
 
-    if let Some((ev, n)) = first_hit(repo, &rs_files, SHOULD_PANIC_NEEDLES) {
+    if let Some((ev, n)) = should_panic {
         out.push(Finding {
             id: "should-panic".to_string(),
             severity: SEV_WARN.to_string(),
@@ -121,7 +133,7 @@ pub fn scan(repo: &Path) -> Result<Vec<Finding>, String> {
         });
     }
 
-    if let Some((ev, n)) = first_hit(repo, &rs_files, BACKTRACE_NEEDLES) {
+    if let Some((ev, n)) = backtrace {
         out.push(Finding {
             id: "backtrace-use".to_string(),
             severity: SEV_WARN.to_string(),
@@ -178,35 +190,58 @@ pub fn banned_knobs(findings: &[Finding]) -> Vec<(String, String, String, String
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    let mut names: Vec<PathBuf> = Vec::new();
+    let mut names: Vec<(PathBuf, std::fs::FileType)> = Vec::new();
     for e in entries {
         let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-        names.push(e.path());
+        let p = e.path();
+        // `DirEntry::file_type` is answered by readdir itself, so the common case
+        // costs no extra stat. Symlinks are resolved explicitly below, because a
+        // source file reached through a link must still be scanned: a *missed*
+        // ban is the one failure this module cannot afford.
+        let ft = e
+            .file_type()
+            .map_err(|err| format!("cannot stat {}: {err}", p.display()))?;
+        names.push((p, ft));
     }
-    names.sort();
-    for p in names {
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, ft) in names {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if p.is_dir() {
-            if SKIP_DIRS.contains(&name) {
-                continue;
+        let resolved = if ft.is_symlink() {
+            match std::fs::metadata(&p) {
+                Ok(m) => Some(m.file_type()),
+                Err(_) => None,
             }
-            walk(&p, out)?;
-        } else if p.is_file() {
-            out.push(p);
+        } else {
+            Some(ft)
+        };
+        match resolved {
+            Some(t) if t.is_dir() => {
+                if SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                walk(&p, out)?;
+            }
+            Some(t) if t.is_file() => out.push(p),
+            _ => {}
         }
     }
     Ok(())
 }
 
-/// First `path:line` match for any marker, plus the total occurrence count.
+/// First `path:line` match per marker group, plus each group's total occurrence
+/// count. All groups are matched in a single pass over the files.
 ///
-/// Matching happens on **code only**: comments, string literals, char literals and
-/// raw strings are blanked out first. Without that, a doc comment that merely
-/// *mentions* `catch_unwind` (including this module's own documentation) is
-/// reported as evidence — and evidence pointing at a comment is worse than none.
-fn first_hit(repo: &Path, files: &[PathBuf], markers: &[&str]) -> Option<(String, usize)> {
-    let mut first: Option<(String, usize)> = None;
-    let mut total = 0usize;
+/// Files whose **raw** text contains no marker at all are skipped before
+/// stripping: stripping only ever removes bytes, so a marker that is not in the
+/// raw text cannot be in the stripped text either. On a real tree this is the
+/// difference between stripping every source file and stripping a handful.
+fn scan_markers(
+    repo: &Path,
+    files: &[PathBuf],
+    groups: &[&[&str]],
+) -> Vec<Option<(String, usize)>> {
+    let mut out: Vec<Option<(String, usize)>> = vec![None; groups.len()];
+    let mut code = String::new();
     for f in files {
         let Ok(meta) = std::fs::metadata(f) else {
             continue;
@@ -214,53 +249,67 @@ fn first_hit(repo: &Path, files: &[PathBuf], markers: &[&str]) -> Option<(String
         if meta.len() > MAX_SCAN_BYTES {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(f) else {
+        let Ok(raw) = std::fs::read_to_string(f) else {
             continue;
         };
-        let code = strip_noncode(&text);
+        if !groups.iter().any(|ms| ms.iter().any(|m| raw.contains(m))) {
+            continue;
+        }
+        code.clear();
+        code.push_str(&strip_noncode(&raw));
         for (i, line) in code.lines().enumerate() {
-            if markers.iter().any(|m| line.contains(m)) {
-                total += 1;
-                if first.is_none() {
-                    let rel = f.strip_prefix(repo).unwrap_or(f);
-                    first = Some((format!("{}:{}", slash_path(rel), i + 1), 0));
+            for (gi, markers) in groups.iter().enumerate() {
+                if !markers.iter().any(|m| line.contains(m)) {
+                    continue;
+                }
+                match &mut out[gi] {
+                    Some((_, n)) => *n += 1,
+                    slot @ None => {
+                        let rel = f.strip_prefix(repo).unwrap_or(f);
+                        *slot = Some((format!("{}:{}", slash_path(rel), i + 1), 1));
+                    }
                 }
             }
         }
     }
-    first.map(|(ev, _)| (ev, total))
+    out
 }
 
 /// Blank out comments and literals while preserving line structure, so line
 /// numbers stay valid. Deliberately not a full lexer: it only has to be right
 /// about the places a marker string can hide.
+///
+/// Runs on bytes: every delimiter it looks for is ASCII, and UTF-8 continuation
+/// bytes are >= 0x80, so they can never be mistaken for one. The earlier version
+/// collected the source into a `Vec<char>` first, which costs 4 bytes per source
+/// byte on top of the copy it produces.
 fn strip_noncode(src: &str) -> String {
-    let b: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
     let mut i = 0usize;
     while i < b.len() {
         let c = b[i];
         // line comment
-        if c == '/' && i + 1 < b.len() && b[i + 1] == '/' {
-            while i < b.len() && b[i] != '\n' {
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
         // block comment (Rust nests them)
-        if c == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
             let mut depth = 1usize;
             i += 2;
             while i < b.len() && depth > 0 {
-                if b[i] == '\n' {
-                    out.push('\n');
+                if b[i] == b'\n' {
+                    out.push(b'\n');
                 }
-                if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
                     continue;
                 }
-                if b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/' {
+                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
                     depth -= 1;
                     i += 2;
                     continue;
@@ -270,28 +319,28 @@ fn strip_noncode(src: &str) -> String {
             continue;
         }
         // raw string: r"..." / r#"..."# / br#"..."#
-        if c == 'r' || (c == 'b' && i + 1 < b.len() && b[i + 1] == 'r') {
-            let start = if c == 'b' { i + 1 } else { i };
-            if start + 1 < b.len() && (b[start + 1] == '#' || b[start + 1] == '"') {
+        if c == b'r' || (c == b'b' && i + 1 < b.len() && b[i + 1] == b'r') {
+            let start = if c == b'b' { i + 1 } else { i };
+            if start + 1 < b.len() && (b[start + 1] == b'#' || b[start + 1] == b'"') {
                 let mut j = start + 1;
                 let mut hashes = 0usize;
-                while j < b.len() && b[j] == '#' {
+                while j < b.len() && b[j] == b'#' {
                     hashes += 1;
                     j += 1;
                 }
-                if j < b.len() && b[j] == '"' {
+                if j < b.len() && b[j] == b'"' {
                     j += 1;
                     loop {
                         if j >= b.len() {
                             break;
                         }
-                        if b[j] == '\n' {
-                            out.push('\n');
+                        if b[j] == b'\n' {
+                            out.push(b'\n');
                         }
-                        if b[j] == '"' {
+                        if b[j] == b'"' {
                             let mut k = j + 1;
                             let mut seen = 0usize;
-                            while k < b.len() && b[k] == '#' && seen < hashes {
+                            while k < b.len() && b[k] == b'#' && seen < hashes {
                                 seen += 1;
                                 k += 1;
                             }
@@ -308,51 +357,82 @@ fn strip_noncode(src: &str) -> String {
             }
         }
         // string literal
-        if c == '"' {
+        if c == b'"' {
             i += 1;
             while i < b.len() {
-                if b[i] == '\\' {
-                    i += 2;
+                if b[i] == b'\\' {
+                    i += 1;
+                    if i < b.len() {
+                        // A backslash before a real newline is a line continuation:
+                        // keep the newline or every later line number shifts by one.
+                        if b[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += utf8_len(b[i]);
+                    }
                     continue;
                 }
-                if b[i] == '"' {
+                if b[i] == b'"' {
                     i += 1;
                     break;
                 }
-                if b[i] == '\n' {
-                    out.push('\n');
+                if b[i] == b'\n' {
+                    out.push(b'\n');
                 }
                 i += 1;
             }
             continue;
         }
         // char literal (not a lifetime: 'a' vs 'a)
-        if c == '\'' {
-            let is_char = if i + 1 < b.len() && b[i + 1] == '\\' {
-                true
-            } else {
-                i + 2 < b.len() && b[i + 2] == '\''
-            };
-            if is_char {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == '\'' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
+        if c == b'\'' {
+            if let Some(end) = char_lit_end(b, i) {
+                i = end + 1;
                 continue;
             }
         }
         out.push(c);
         i += 1;
     }
-    out
+    // Only whole characters are ever appended, so the result is still valid UTF-8.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Index of the closing `'` of a char literal starting at `b[i] == '\''`, or
+/// `None` when this is a lifetime (`'a`) or a lone quote.
+fn char_lit_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    if j >= b.len() {
+        return None;
+    }
+    if b[j] == b'\\' {
+        // \n, \\, \x41, \u{1F600}: the payload has no quote of its own.
+        j += 1;
+        let limit = (i + 16).min(b.len());
+        while j < limit && b[j] != b'\'' {
+            j += 1;
+        }
+        return if j < limit && b[j] == b'\'' {
+            Some(j)
+        } else {
+            None
+        };
+    }
+    j += utf8_len(b[j]);
+    if j < b.len() && b[j] == b'\'' {
+        Some(j)
+    } else {
+        None
+    }
+}
+
+/// Length in bytes of the UTF-8 character whose leading byte is `b0`.
+fn utf8_len(b0: u8) -> usize {
+    match b0 {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
 }
 
 /// Render a path with `/` separators on every platform.

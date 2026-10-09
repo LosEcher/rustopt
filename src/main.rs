@@ -30,10 +30,11 @@ rustopt - measure release-profile variants, recommend a smaller artifact, gate o
 
 USAGE
   rustopt plan   [--manifest DIR] [--variants a,b,c] [--work-dir DIR] [--ephemeral]
-                 [--dry-run] [--offline] [--jobs N] [--emit json|pretty]
-                 [--log PATH | --no-log]
+                 [--dry-run] [--offline] [--jobs N] [--build-profile NAME]
+                 [--emit json|pretty] [--log PATH | --no-log]
   rustopt check  [--manifest DIR] --budget SIZE [--work-dir DIR] [--ephemeral]
-                 [--offline] [--jobs N] [--emit json|pretty] [--log PATH | --no-log]
+                 [--offline] [--jobs N] [--build-profile NAME]
+                 [--emit json|pretty] [--log PATH | --no-log]
   rustopt ledger [--tail N] [--run ID] [--log PATH] [--emit json|pretty]
   rustopt clean  [--repo DIR] [--work-dir DIR] [--apply] [--emit json|pretty]
 
@@ -46,10 +47,13 @@ EXIT
   2  tool error (usage, I/O, no bin target, build that could not be measured)
 
 NOTES
-  plan measures every selected variant with a real `cargo build --release` in an
-  isolated CARGO_TARGET_DIR; it never edits the package. The first run is
-  therefore slow and later runs reuse the per-variant work dirs.
+  plan measures every selected variant with a real `cargo build` in an isolated
+  CARGO_TARGET_DIR; it never edits the package. The first run is therefore slow
+  and later runs reuse the per-variant work dirs.
   Variants marked (default) are measured by `plan` unless --variants is given.
+  --build-profile NAME measures `--profile NAME` instead of cargo's `release`
+  (the profile must be declared in the manifest). Use it to gate the artifact a
+  package actually publishes, e.g. `check --build-profile dist`.
   The only file written into the working directory is the ledger (--no-log
   disables it; --log PATH moves it).";
 
@@ -64,6 +68,7 @@ const VALUE_OPTS: &[&str] = &[
     "--tail",
     "--run",
     "--repo",
+    "--build-profile",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--dry-run",
@@ -88,7 +93,7 @@ impl Args {
         let mut flags = Vec::new();
         let mut i = 0;
         while i < argv.len() {
-            let a = argv[i].clone();
+            let a = argv[i].as_str();
             if a.starts_with("--") {
                 if let Some(eq) = a.find('=') {
                     let key = &a[..eq];
@@ -99,17 +104,16 @@ impl Args {
                     }
                 }
             }
-            if VALUE_OPTS.contains(&a.as_str()) {
+            if VALUE_OPTS.contains(&a) {
                 let v = argv
                     .get(i + 1)
-                    .ok_or_else(|| format!("{a} needs a value"))?
-                    .clone();
-                values.insert(a, v);
+                    .ok_or_else(|| format!("{a} needs a value"))?;
+                values.insert(a.to_string(), v.clone());
                 i += 2;
                 continue;
             }
-            if FLAG_OPTS.contains(&a.as_str()) {
-                flags.push(a);
+            if FLAG_OPTS.contains(&a) {
+                flags.push(a.to_string());
                 i += 1;
                 continue;
             }
@@ -253,6 +257,24 @@ fn log_path(args: &Args) -> Option<PathBuf> {
     )
 }
 
+/// A profile name reaches `--config profile.<name>.<key>=<value>`, so it must not
+/// be able to smuggle in a key, a value or an operator of its own.
+fn parse_profile_name(raw: &str) -> Result<String, String> {
+    let p = raw.trim();
+    if p.is_empty() {
+        return Err("--build-profile needs a name (e.g. dist)".to_string());
+    }
+    let ok = p
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        return Err(format!(
+            "--build-profile {p:?} is not a cargo profile name (letters, digits, `_`, `-`)"
+        ));
+    }
+    Ok(p.to_string())
+}
+
 fn build_opts(args: &Args) -> Result<measure::BuildOpts, String> {
     let jobs = match args.get("--jobs") {
         Some(s) => Some(
@@ -261,10 +283,15 @@ fn build_opts(args: &Args) -> Result<measure::BuildOpts, String> {
         ),
         None => None,
     };
+    let profile = match args.get("--build-profile") {
+        Some(p) => Some(parse_profile_name(p)?),
+        None => None,
+    };
     Ok(measure::BuildOpts {
         dry_run: args.has("--dry-run"),
         offline: args.has("--offline"),
         jobs,
+        profile,
     })
 }
 
@@ -374,11 +401,17 @@ fn dir_size(path: &Path) -> Result<u64, String> {
         Err(_) => return Ok(0),
     };
     for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            total = total.saturating_add(dir_size(&p)?);
-        } else if let Ok(m) = std::fs::metadata(&p) {
-            total = total.saturating_add(m.len());
+        // `DirEntry::file_type` comes from readdir itself: it costs no extra
+        // stat, and it reports a symlink *as* a symlink instead of following it.
+        // The old `p.is_dir()` + `fs::metadata(&p)` pair paid two stats per
+        // entry and would follow a link farm (or a cycle) under a work dir.
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size(&e.path())?);
+        } else if ft.is_file() {
+            if let Ok(m) = e.metadata() {
+                total = total.saturating_add(m.len());
+            }
         }
     }
     Ok(total)
@@ -470,6 +503,17 @@ mod tests {
     fn emit_is_validated() {
         let a = Args::parse(&v(&["--emit", "xml"])).unwrap();
         assert!(a.emit().is_err());
+    }
+
+    #[test]
+    fn profile_names_are_trimmed_and_validated() {
+        assert_eq!(parse_profile_name(" dist ").unwrap(), "dist");
+        assert_eq!(parse_profile_name("no-panic").unwrap(), "no-panic");
+        assert_eq!(parse_profile_name("release_2").unwrap(), "release_2");
+        // A name is interpolated into `--config profile.<name>.<key>=<value>`.
+        assert!(parse_profile_name("").is_err());
+        assert!(parse_profile_name("dist.opt-level=\"z\"").is_err());
+        assert!(parse_profile_name("dist lto=fat").is_err());
     }
 
     #[test]

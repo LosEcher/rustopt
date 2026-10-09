@@ -11,8 +11,20 @@
 //! overriding only what you think is neutral) can be *larger* than the real
 //! default and make `strip` look more valuable than it is.
 
-/// Prefix for every `--config` key this tool writes.
-pub const PROFILE_PREFIX: &str = "profile.release";
+/// The profile `plan` ablates and `check` measures unless `--build-profile`
+/// selects another one.
+///
+/// `release` is cargo's built-in profile, so it needs no manifest declaration.
+/// Any other name (for example `dist`, the profile this crate ships from) must
+/// exist in the package's manifest, and cargo rejects the build if it does not —
+/// which is what makes a typo behave as a tool error instead of a false pass.
+pub const DEFAULT_PROFILE: &str = "release";
+
+/// `--config` key prefix for a named profile, e.g. `profile.release`.
+#[must_use]
+pub fn profile_prefix(profile: &str) -> String {
+    format!("profile.{profile}")
+}
 
 /// cargo's release-profile defaults, spelled out (TOML literals, quotes included).
 pub const CARGO_DEFAULTS: &[(&str, &str)] = &[
@@ -172,13 +184,15 @@ pub fn composed_knobs(v: &Variant) -> Vec<(&'static str, &'static str)> {
     out
 }
 
-/// `--config` argv fragment for a variant (empty for `current`).
+/// `--config` argv fragment for a variant (empty for `current`), applied to the
+/// named profile.
 #[must_use]
-pub fn config_args(v: &Variant) -> Vec<String> {
+pub fn config_args(v: &Variant, profile: &str) -> Vec<String> {
+    let prefix = profile_prefix(profile);
     let mut out = Vec::new();
     for (k, val) in composed_knobs(v) {
         out.push("--config".to_string());
-        out.push(format!("{PROFILE_PREFIX}.{k}={val}"));
+        out.push(format!("{prefix}.{k}={val}"));
     }
     out
 }
@@ -209,7 +223,7 @@ mod tests {
     fn current_passes_no_overrides() {
         let v = by_name("current").unwrap();
         assert!(v.no_overrides);
-        assert!(config_args(v).is_empty());
+        assert!(config_args(v, DEFAULT_PROFILE).is_empty());
         assert!(composed_knobs(v).is_empty());
     }
 
@@ -228,10 +242,28 @@ mod tests {
     #[test]
     fn config_args_are_pairs_of_flag_and_literal() {
         let v = by_name("lto").unwrap();
-        let args = config_args(v);
+        let args = config_args(v, DEFAULT_PROFILE);
         assert_eq!(args.len() % 2, 0);
         assert!(args.iter().any(|a| a == "profile.release.lto=\"fat\""));
         assert!(args.iter().any(|a| a == "profile.release.codegen-units=1"));
+    }
+
+    #[test]
+    fn config_args_follow_the_selected_profile() {
+        let v = by_name("tuned").unwrap();
+        let args = config_args(v, "dist");
+        assert!(
+            args.iter().any(|a| a == "profile.dist.opt-level=\"z\""),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "profile.dist.strip=\"symbols\""),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("profile.release.")),
+            "a named profile must not leak the release prefix: {args:?}"
+        );
     }
 
     #[test]

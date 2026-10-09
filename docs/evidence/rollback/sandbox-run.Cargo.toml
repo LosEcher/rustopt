@@ -1,0 +1,63 @@
+[package]
+name = "sandbox-run-cli"
+version = "0.1.3"
+edition = "2021"
+description = "Isolated verification execution for AI agents: run build/test/lint inside a git worktree or jj workspace so the main tree is never polluted. Binary: sandbox-run."
+license = "MIT"
+repository = "https://github.com/LosEcher/sandbox-run"
+keywords = ["sandbox", "verify", "agent", "worktree", "isolation"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "sandbox-run"
+path = "src/main.rs"
+
+# --- Shipped-artifact size ---------------------------------------------------------------
+# Artifact size and build time pull in opposite directions, so they get two profiles
+# instead of one compromise that silently pays for both:
+#
+#   --release  (deliberately left as cargo's default: nothing is overridden)
+#       what developers and the pull-request CI matrix build. `codegen-units = 16` keeps
+#       intra-crate parallelism and there is no LTO, so it stays fast; `cargo install
+#       sandbox-run-cli` lands here too, so users get a fast local build.
+#
+#   --profile dist
+#       only used when producing the published release assets. This is where the size
+#       knobs live, and only the tag-time packaging job pays for them: measured ~2x
+#       wall-clock, worse on a loaded machine, because `codegen-units = 1` removes the
+#       parallelism that lets a build absorb contention.
+#
+# The knobs are NOT in [profile.release]: they made every single `--release` build about
+# twice as slow, for bytes that only leave the building from a tagged release.
+[profile.release]
+# Intentionally empty: cargo's defaults. The size knobs live in [profile.dist] below.
+
+[profile.dist]
+inherits = "release" # required: cargo errors out on a custom profile without it
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# Measured, not guessed: this combination is substantially smaller than the default release
+# profile, while `opt-level = "z"` on its own is *larger* than the default `opt-level = 3`
+# here. Single-knob comparisons mislead; only the measured combination is meaningful.
+# `strip` removes the symbol table (a real size win for the shipped binary) but also makes
+# `cargo bloat` / `nm` useless. For size analysis, override it for a single build:
+#   cargo build --profile dist --config 'profile.dist.strip="none"'
+# `panic = "abort"` is deliberately NOT set, in any profile: it changes crash behaviour
+# from unwinding (exit 101) to SIGABRT (exit 134), while this tool's exit contract is
+# 0/1/2 — abort would quietly rewrite the crash semantics of that contract.
+#
+# The shipped binary is `sandbox-run`, but the package/binary manifest names differ
+# (`sandbox-run-cli`): `cargo install sandbox-run-cli` is what puts `sandbox-run` on PATH.
+
+# cargo never reclaims `target/*/incremental`, and it ends up dwarfing the working set it
+# accelerates. Off here; the cost is a few seconds per crate when recompiling.
+[profile.dev]
+incremental = false

@@ -6,3 +6,8 @@ publish = false
 
 # Its own workspace root so this fixture is never absorbed by a parent package.
 [workspace]
+
+# A named profile, so the CLI tests can prove `--build-profile dist` measures the
+# profile a package ships from instead of cargo's built-in `release`.
+[profile.dist]
+inherits = "release"

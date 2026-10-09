@@ -1,0 +1,16 @@
+# 接线：把编译器产物缓存（sccache）挂到所有 cargo 构建上。
+# 由 rustopt 的构建性能分析落地（见 docs/），三条实测前提：
+#   1) RUSTC_WRAPPER 不进 cargo 指纹 —— 本机 1.97 实测：加/去 wrapper 都不触发重编，
+#      所以接线本身不需要任何全量重编。
+#   2) 跨项目命中【只在没有显式设置 CARGO_TARGET_DIR 时】有效。实测：即使把该变量设成
+#      与默认完全相同的路径，跨项目命中也会从 21/22 掉到 17/22；设成自定义目录则归零。
+#   3) sccache 不缓存 bin / cdylib / 带 -C incremental 的单元 —— 也就是"你正在改的那个
+#      crate"永远不进缓存，获益的是依赖树与跨项目/跨机器复用。
+# 回滚：删除本文件即可（或删掉 rustc-wrapper 一行）。
+[build]
+rustc-wrapper = "sccache"
+
+# 服务端出 IO 错误时退回"本地直接编译"，而不是让整个构建失败。
+# （sccache 0.17.0 的二进制里确认存在该变量名。）
+[env]
+SCCACHE_IGNORE_SERVER_IO_ERROR = "1"

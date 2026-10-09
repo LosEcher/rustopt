@@ -67,6 +67,8 @@ pub struct Plan {
     pub package_version: String,
     pub rustc: String,
     pub host: String,
+    /// Cargo profile this plan ablated (`release` unless `--build-profile`).
+    pub build_profile: String,
     pub variants: Vec<VariantResult>,
     pub findings: Vec<Finding>,
     pub rejected: Vec<Rejected>,
@@ -86,6 +88,8 @@ pub struct CheckReport {
     pub package_version: String,
     pub rustc: String,
     pub host: String,
+    /// Cargo profile that was measured (`release` unless `--build-profile`).
+    pub build_profile: String,
     pub variant: String,
     pub command: String,
     pub stderr_hash: String,
@@ -119,15 +123,25 @@ fn log_to(log: &Option<PathBuf>, ev: &Event) -> Result<(), String> {
 pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
     let canonical = std::fs::canonicalize(repo)
         .map_err(|e| format!("cannot resolve manifest dir {}: {e}", repo.display()))?;
-    let meta = measure::package_meta(&canonical, opts.build.offline)?;
+    // These three are independent of each other (two subprocess spawns and a
+    // read-only tree walk), and they are the whole fixed cost of a run: on a
+    // warm work dir they dominate the wall clock. Overlapping them costs nothing
+    // and takes the critical path from the sum to the slowest one.
+    let (meta, tc, findings) = std::thread::scope(|s| {
+        let meta = s.spawn(|| measure::package_meta(&canonical, opts.build.offline));
+        let tc = s.spawn(measure::toolchain);
+        let scan = s.spawn(|| guard::scan(&canonical));
+        (meta.join(), tc.join(), scan.join())
+    });
+    let meta = meta.map_err(|_| "internal panic in cargo metadata probe".to_string())??;
     if meta.bin_targets.is_empty() {
         return Err(format!(
             "package {:?} declares no bin target; rustopt measures executables only",
             meta.name
         ));
     }
-    let tc = measure::toolchain()?;
-    let findings = guard::scan(&canonical)?;
+    let tc = tc.map_err(|_| "internal panic in rustc probe".to_string())??;
+    let findings = findings.map_err(|_| "internal panic in guard scan".to_string())??;
     let banned = guard::banned_knobs(&findings);
 
     log_to(
@@ -354,6 +368,7 @@ pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
         package_version: meta.version,
         rustc: tc.rustc,
         host: tc.host,
+        build_profile: opts.build.profile_name().to_string(),
         variants: results,
         findings,
         rejected,
@@ -381,14 +396,19 @@ pub fn run(repo: &Path, opts: &PlanOpts) -> Result<Plan, String> {
 pub fn check(repo: &Path, opts: &PlanOpts, budget_bytes: u64) -> Result<CheckReport, String> {
     let canonical = std::fs::canonicalize(repo)
         .map_err(|e| format!("cannot resolve manifest dir {}: {e}", repo.display()))?;
-    let meta = measure::package_meta(&canonical, opts.build.offline)?;
+    let (meta, tc) = std::thread::scope(|s| {
+        let meta = s.spawn(|| measure::package_meta(&canonical, opts.build.offline));
+        let tc = s.spawn(measure::toolchain);
+        (meta.join(), tc.join())
+    });
+    let meta = meta.map_err(|_| "internal panic in cargo metadata probe".to_string())??;
     if meta.bin_targets.is_empty() {
         return Err(format!(
             "package {:?} declares no bin target; rustopt measures executables only",
             meta.name
         ));
     }
-    let tc = measure::toolchain()?;
+    let tc = tc.map_err(|_| "internal panic in rustc probe".to_string())??;
     let current = variants::by_name("current").ok_or("internal: no `current` variant")?;
 
     log_to(
@@ -457,6 +477,7 @@ pub fn check(repo: &Path, opts: &PlanOpts, budget_bytes: u64) -> Result<CheckRep
         package_version: meta.version,
         rustc: tc.rustc,
         host: tc.host,
+        build_profile: opts.build.profile_name().to_string(),
         variant: current.name.to_string(),
         command: outcome.command.clone(),
         stderr_hash: outcome.stderr_hash.clone(),

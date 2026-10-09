@@ -1,0 +1,68 @@
+[package]
+name = "session-index"
+version = "0.1.0"
+edition = "2021"
+description = "Queryable SQLite EAV projection over DSH session event logs: ingest session.jsonl exports, then query by event kind / tool name / args hash / error / time range. Feeds kernel-audit and run-diff; prototype for the harness dsh-session-index."
+license = "MIT"
+repository = "https://github.com/LosEcher/session-index"
+keywords = ["session", "agent", "sqlite", "index", "search"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "session-index"
+
+# --- Shipped-artifact size vs build time --------------------------------------------------
+# Artifact size and build time usually pull in opposite directions, so they get two
+# profiles instead of one compromise that silently pays for both. On *this* crate the
+# measurement says something different, and the measurement wins over the rule.
+#
+# MEASURED EXCEPTION (why `opt-level = "z"` stays in release here):
+#   `rusqlite` builds bundled SQLite with the `cc` crate, and the C optimisation level
+#   follows the profile's opt-level (default release = -O3, opt-level = "z" = -Oz —
+#   verified by wrapping CC and reading the raw argv). sqlite3.c is the single most
+#   expensive unit in this dependency graph, so for this crate `opt-level = "z"` is a
+#   *compile-speed* knob as well as a size knob:
+#
+#     cargo-default release (opt-level=3)      19.2s   2,415,856 B
+#     opt-level = "z" alone                    11.5s   1,778,320 B   <- both axes better
+#     lto = "fat" alone                        24.6s
+#     full dist set (z + fat + cgu1 + strip)   14.7s   1,259,552 B   <- smallest
+#
+#   So `release` keeps `opt-level = "z"` (faster *and* smaller than cargo's default here,
+#   which also makes `cargo install session-index` better for users) and `dist` adds the
+#   genuinely expensive knobs.
+#
+# On the other crates in this family the same knob is time-neutral or time-negative, which
+# is why it lives in dist there. Fleet-wide consistency of the *rule* was rejected in favour
+# of per-crate evidence.
+#
+#   --release   opt-level = "z", no LTO, 16 codegen units: fast, and small enough
+#   --profile dist   adds lto/one codegen unit/strip: the published asset, tag time only
+#
+# There is no release workflow yet, so nothing builds [profile.dist] today: it is staged
+# for the day this crate is packaged.
+[profile.release]
+opt-level = "z"
+
+[profile.dist]
+inherits = "release" # required: cargo errors out on a custom profile without it
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# `strip` removes the symbol table (a real size win for the shipped binary) but also makes
+# `cargo bloat` / `nm` useless. For size analysis, override it for a single build:
+#   cargo build --profile dist --config 'profile.dist.strip="none"'
+# `panic = "abort"` is deliberately NOT set, in every profile and not just this one: it
+# changes crash behaviour from unwinding (exit 101) to SIGABRT (exit 134), and exit codes
+# are part of this tool's contract.
+
+# cargo never reclaims `target/*/incremental`, and it ends up dwarfing the working set it
+# accelerates. Off here; the cost is a few seconds per crate when recompiling.
+[profile.dev]
+incremental = false

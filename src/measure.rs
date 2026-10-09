@@ -43,11 +43,25 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BuildOpts {
     pub dry_run: bool,
     pub offline: bool,
     pub jobs: Option<u32>,
+    /// Profile to build. `None` means cargo's built-in `release`; anything else
+    /// is passed as `--profile <name>` and must exist in the package manifest.
+    ///
+    /// This is what lets `check` gate the artifact a package actually *publishes*
+    /// when that package ships from a custom profile instead of `release`.
+    pub profile: Option<String>,
+}
+
+impl BuildOpts {
+    /// The profile name in effect, for argv rendering and reports.
+    #[must_use]
+    pub fn profile_name(&self) -> &str {
+        self.profile.as_deref().unwrap_or(variants::DEFAULT_PROFILE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,11 +81,15 @@ pub struct PkgMeta {
 /// `cargo build --release --message-format=json` argv for one variant.
 #[must_use]
 pub fn cargo_argv(variant: &Variant, opts: &BuildOpts, locked: bool) -> Vec<String> {
-    let mut argv = vec![
-        "build".to_string(),
-        "--release".to_string(),
-        "--message-format=json".to_string(),
-    ];
+    let mut argv = vec!["build".to_string()];
+    let profile = opts.profile_name();
+    if profile == variants::DEFAULT_PROFILE {
+        argv.push("--release".to_string());
+    } else {
+        argv.push("--profile".to_string());
+        argv.push(profile.to_string());
+    }
+    argv.push("--message-format=json".to_string());
     if locked {
         argv.push("--locked".to_string());
     }
@@ -82,7 +100,7 @@ pub fn cargo_argv(variant: &Variant, opts: &BuildOpts, locked: bool) -> Vec<Stri
         argv.push("-j".to_string());
         argv.push(j.to_string());
     }
-    argv.extend(variants::config_args(variant));
+    argv.extend(variants::config_args(variant, profile));
     argv
 }
 
@@ -214,44 +232,63 @@ pub fn build(
 
 /// Pull `(target name, executable path)` for every `bin` artifact in cargo's
 /// JSON message stream. Last occurrence wins (cargo re-reports fresh artifacts).
+///
+/// Two things make this cheap enough to sit in front of a build that may emit
+/// tens of megabytes: a byte-level prefilter, and borrowed deserialization into
+/// just the three fields this needs. A real stream is mostly `compiler-message`
+/// lines whose `rendered` field is a page of diagnostics each; building a
+/// `serde_json::Value` for those (and copying the whole buffer first) costs more
+/// than the rest of the tool put together.
 fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
+    // `from_utf8_lossy` borrows when the stream is valid UTF-8, which it is for
+    // cargo's own JSON: no copy of the whole buffer.
     let text = String::from_utf8_lossy(stdout);
     let mut found: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
+        if !line.contains("compiler-artifact") {
+            continue;
+        }
         let line = line.trim();
         if !line.starts_with('{') {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(msg) = serde_json::from_str::<ArtifactMsg>(line) else {
             continue;
         };
-        if v.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
+        if msg.reason != "compiler-artifact" {
             continue;
         }
-        let Some(exe) = v.get("executable").and_then(serde_json::Value::as_str) else {
+        let (Some(exe), Some(target)) = (msg.executable, msg.target) else {
             continue;
         };
-        let target = v.get("target");
-        let is_bin = target
-            .and_then(|t| t.get("kind"))
-            .and_then(serde_json::Value::as_array)
-            .map(|ks| ks.iter().any(|k| k.as_str() == Some("bin")))
-            .unwrap_or(false);
-        if !is_bin {
+        if !target.kind.contains(&"bin") {
             continue;
         }
-        let name = target
-            .and_then(|t| t.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?")
-            .to_string();
-        let exe = exe.to_string();
-        match found.iter_mut().find(|(n, _)| *n == name) {
-            Some(slot) => slot.1 = exe,
-            None => found.push((name, exe)),
+        let name = target.name.unwrap_or("?");
+        match found.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = exe.to_string(),
+            None => found.push((name.to_string(), exe.to_string())),
         }
     }
     found
+}
+
+/// The subset of a `compiler-artifact` message this tool reads. Fields are
+/// borrowed from the message, and everything absent or of the wrong shape makes
+/// the line fail to parse — which is how a non-JSON line (cargo forwards raw
+/// build-script stdout) is skipped rather than guessed at.
+#[derive(serde::Deserialize)]
+struct ArtifactMsg<'a> {
+    reason: &'a str,
+    executable: Option<&'a str>,
+    target: Option<ArtifactTarget<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ArtifactTarget<'a> {
+    name: Option<&'a str>,
+    #[serde(default)]
+    kind: Vec<&'a str>,
 }
 
 /// `rustc -vV`, reduced to the two facts a plan should record.
@@ -411,11 +448,34 @@ mod tests {
     }
 
     #[test]
+    fn a_diagnostic_that_merely_mentions_artifacts_is_not_an_artifact() {
+        // The prefilter lets this line through on purpose; the typed reader must
+        // still reject it on `reason`, not on the substring.
+        let diag = "{\"reason\":\"compiler-message\",\"message\":{\"rendered\":\"no compiler-artifact here\"}}";
+        let stdout = format!(
+            "{diag}\n{}\n",
+            artifact_msg("mytool", "bin", Some("/tmp/real"))
+        );
+        let got = collect_bin_artifacts(stdout.as_bytes());
+        assert_eq!(got, vec![("mytool".to_string(), "/tmp/real".to_string())]);
+    }
+
+    #[test]
+    fn a_bin_target_without_a_name_falls_back() {
+        let line = "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"bin\"]},\"executable\":\"/tmp/x\"}";
+        assert_eq!(
+            collect_bin_artifacts(line.as_bytes()),
+            vec![("?".to_string(), "/tmp/x".to_string())]
+        );
+    }
+
+    #[test]
     fn argv_shape_is_stable() {
         let opts = BuildOpts {
             dry_run: false,
             offline: true,
             jobs: Some(4),
+            profile: None,
         };
         let argv = cargo_argv(by_name("tuned").unwrap(), &opts, true);
         assert_eq!(argv[0], "build");
@@ -427,6 +487,24 @@ mod tests {
         assert!(argv.contains(&"profile.release.strip=\"symbols\"".to_string()));
         let rendered = render_command(&argv);
         assert!(rendered.starts_with("cargo build --release"));
+    }
+
+    #[test]
+    fn a_named_profile_replaces_release_everywhere() {
+        let opts = BuildOpts {
+            profile: Some("dist".to_string()),
+            ..BuildOpts::default()
+        };
+        let argv = cargo_argv(by_name("tuned").unwrap(), &opts, false);
+        assert!(!argv.contains(&"--release".to_string()));
+        assert_eq!(argv[0], "build");
+        assert!(argv.contains(&"--profile".to_string()));
+        assert!(argv.contains(&"dist".to_string()));
+        assert!(argv.contains(&"profile.dist.opt-level=\"z\"".to_string()));
+        assert!(
+            !argv.iter().any(|a| a.starts_with("profile.release.")),
+            "a named build profile must not carry release overrides: {argv:?}"
+        );
     }
 
     #[test]
