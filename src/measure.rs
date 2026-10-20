@@ -352,6 +352,11 @@ fn collect_bin_artifacts_detailed(stdout: &[u8]) -> (Vec<(String, String)>, usiz
     (found, unparsed)
 }
 
+/// Test-facing view of the collector. `cfg(test)` because production always
+/// needs the unparsed count too; without it clippy's `-D warnings` rejects the
+/// function as dead code on a non-test build (the ubuntu CI job caught exactly
+/// that after the fix landed).
+#[cfg(test)]
 fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
     collect_bin_artifacts_detailed(stdout).0
 }
