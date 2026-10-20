@@ -86,6 +86,30 @@ jobs:
           fi
           cargo check --locked --all-targets
 
+  # Miri under Tree Borrows, restricted to the syscall-free pure core
+  # (`budget` / `variants` / `fnv` / `report` / `measure`). The interesting part
+  # is the arithmetic: a wrong unit multiplier or an off-by-one in the size plan
+  # is silent in a normal test run. `guard`/`ledger`/`events` touch the
+  # filesystem and are excluded by measurement. Keep in sync with
+  # scripts/miri-pure-core.conf (the gate asserts a test floor).
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --component rust-src
+          cargo +nightly miri --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: miri
+          cache-on-failure: true
+      - name: Gate self-test (negative controls)
+        run: bash scripts/miri-pure-core.sh --self-test
+      - name: Miri pure core (Tree Borrows)
+        run: bash scripts/miri-pure-core.sh
+
   release:
     name: release (${{ matrix.asset }})
     if: startsWith(github.ref, 'refs/tags/v')
