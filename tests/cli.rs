@@ -59,6 +59,25 @@ fn fixture(tag: &str, name: &str) -> PathBuf {
 struct Run {
     code: i32,
     stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    /// Everything the child said, for assertion messages.
+    ///
+    /// Without this the tests only compare exit codes, and a Windows-only
+    /// `exit 2` is then indistinguishable from any other `exit 2`: the child's
+    /// own `rustopt: …` line is exactly what names the failing step (metadata,
+    /// build, or artifact discovery). Five tests sat red on windows-latest for
+    /// eleven days because that line was captured and thrown away.
+    fn dump(&self) -> String {
+        format!(
+            "exit {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.code,
+            self.stdout.trim_end(),
+            self.stderr.trim_end()
+        )
+    }
 }
 
 fn run(args: &[&str]) -> Run {
@@ -69,13 +88,14 @@ fn run(args: &[&str]) -> Run {
     Run {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
     }
 }
 
 fn json(args: &[&str]) -> serde_json::Value {
     let r = run(args);
-    assert_eq!(r.code, 0, "expected exit 0, got {}", r.code);
-    serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("bad json: {e}\n{}", r.stdout))
+    assert_eq!(r.code, 0, "expected exit 0\n{}", r.dump());
+    serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("bad json: {e}\n{}", r.dump()))
 }
 
 #[test]
@@ -214,7 +234,7 @@ fn budget_gate_returns_one_when_exceeded_and_zero_when_not() {
         "--offline",
         "--no-log",
     ]);
-    assert_eq!(over.code, 1, "over budget must exit 1");
+    assert_eq!(over.code, 1, "over budget must exit 1\n{}", over.dump());
 
     let under = run(&[
         "check",
@@ -227,8 +247,8 @@ fn budget_gate_returns_one_when_exceeded_and_zero_when_not() {
         "--offline",
         "--no-log",
     ]);
-    assert_eq!(under.code, 0, "within budget must exit 0");
-    assert!(under.stdout.contains("PASS"), "{}", under.stdout);
+    assert_eq!(under.code, 0, "within budget must exit 0\n{}", under.dump());
+    assert!(under.stdout.contains("PASS"), "{}", under.dump());
 }
 
 #[test]
@@ -322,7 +342,7 @@ fn ledger_records_runs_and_projects_them_back() {
         "--log",
         log.to_str().unwrap(),
     ]);
-    assert_eq!(r.code, 0);
+    assert_eq!(r.code, 0, "check must succeed\n{}", r.dump());
     assert!(log.exists(), "ledger must be written at the requested path");
 
     let text = std::fs::read_to_string(&log).unwrap();
@@ -351,8 +371,8 @@ fn ledger_of_a_missing_file_is_empty_not_an_error() {
         "--log",
         work.join("absent.jsonl").to_str().unwrap(),
     ]);
-    assert_eq!(r.code, 0);
-    assert!(r.stdout.contains("(no runs)"), "{}", r.stdout);
+    assert_eq!(r.code, 0, "an absent ledger is not an error\n{}", r.dump());
+    assert!(r.stdout.contains("(no runs)"), "{}", r.dump());
 }
 
 #[test]
@@ -384,15 +404,15 @@ fn clean_previews_then_applies() {
         "--offline",
         "--no-log",
     ]);
-    assert_eq!(r.code, 0);
+    assert_eq!(r.code, 0, "the build under test must succeed\n{}", r.dump());
 
     let preview = run(&["clean", "--work-dir", work.to_str().unwrap()]);
-    assert_eq!(preview.code, 0);
+    assert_eq!(preview.code, 0, "preview must succeed\n{}", preview.dump());
     assert!(work.exists(), "preview must not delete anything");
-    assert!(preview.stdout.contains("logical"), "{}", preview.stdout);
+    assert!(preview.stdout.contains("logical"), "{}", preview.dump());
 
     let applied = run(&["clean", "--work-dir", work.to_str().unwrap(), "--apply"]);
-    assert_eq!(applied.code, 0);
+    assert_eq!(applied.code, 0, "apply must succeed\n{}", applied.dump());
     assert!(!work.exists(), "--apply must remove the work dir");
 }
 
