@@ -246,8 +246,19 @@ pub fn build(
         });
     }
 
-    let collected = collect_bin_artifacts(&out.stdout);
+    let (collected, unparsed) = collect_bin_artifacts_detailed(&out.stdout);
     if collected.is_empty() {
+        // Naming the unparsed count turns "the tool cannot read cargo" (a bug in
+        // this tool) into something the caller can tell apart from "the package
+        // really has no bin target" (a fact about the package).
+        let error = if unparsed > 0 {
+            format!(
+                "build succeeded but {unparsed} artifact message(s) could not be parsed \
+                 (this is a rustopt bug, not a package problem)"
+            )
+        } else {
+            "build succeeded but no executable artifact was reported".to_string()
+        };
         return Ok(Outcome {
             variant: variant.name.to_string(),
             command,
@@ -258,7 +269,7 @@ pub fn build(
             duration_ms,
             stderr_hash,
             stderr_len,
-            error: Some("build succeeded but no executable artifact was reported".to_string()),
+            error: Some(error),
         });
     }
 
@@ -293,17 +304,21 @@ pub fn build(
 /// Pull `(target name, executable path)` for every `bin` artifact in cargo's
 /// JSON message stream. Last occurrence wins (cargo re-reports fresh artifacts).
 ///
-/// Two things make this cheap enough to sit in front of a build that may emit
-/// tens of megabytes: a byte-level prefilter, and borrowed deserialization into
-/// just the three fields this needs. A real stream is mostly `compiler-message`
-/// lines whose `rendered` field is a page of diagnostics each; building a
-/// `serde_json::Value` for those (and copying the whole buffer first) costs more
-/// than the rest of the tool put together.
-fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
+/// `unparsed` counts lines that *looked* like artifact events but failed to
+/// deserialize. It is reported by the caller instead of being swallowed: a
+/// message this tool cannot read is a bug in this tool, and silence about it
+/// once cost eleven days of red Windows CI (see `ArtifactMsg`).
+///
+/// The prefilter is what keeps this cheap: a real stream is mostly
+/// `compiler-message` lines whose `rendered` field is a page of diagnostics, and
+/// those never reach the typed reader. Only artifact lines are parsed, so owning
+/// the two strings costs a handful of allocations per build.
+fn collect_bin_artifacts_detailed(stdout: &[u8]) -> (Vec<(String, String)>, usize) {
     // `from_utf8_lossy` borrows when the stream is valid UTF-8, which it is for
     // cargo's own JSON: no copy of the whole buffer.
     let text = String::from_utf8_lossy(stdout);
     let mut found: Vec<(String, String)> = Vec::new();
+    let mut unparsed = 0usize;
     for line in text.lines() {
         if !line.contains("compiler-artifact") {
             continue;
@@ -312,8 +327,12 @@ fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
         if !line.starts_with('{') {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<ArtifactMsg>(line) else {
-            continue;
+        let msg = match serde_json::from_str::<ArtifactMsg>(line) {
+            Ok(msg) => msg,
+            Err(_) => {
+                unparsed += 1;
+                continue;
+            }
         };
         if msg.reason != "compiler-artifact" {
             continue;
@@ -321,34 +340,46 @@ fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
         let (Some(exe), Some(target)) = (msg.executable, msg.target) else {
             continue;
         };
-        if !target.kind.contains(&"bin") {
+        if !target.kind.iter().any(|k| k == "bin") {
             continue;
         }
-        let name = target.name.unwrap_or("?");
-        match found.iter_mut().find(|(n, _)| n == name) {
-            Some(slot) => slot.1 = exe.to_string(),
-            None => found.push((name.to_string(), exe.to_string())),
+        let name = target.name.unwrap_or_else(|| "?".to_string());
+        match found.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = exe,
+            None => found.push((name, exe)),
         }
     }
-    found
+    (found, unparsed)
 }
 
-/// The subset of a `compiler-artifact` message this tool reads. Fields are
-/// borrowed from the message, and everything absent or of the wrong shape makes
-/// the line fail to parse — which is how a non-JSON line (cargo forwards raw
-/// build-script stdout) is skipped rather than guessed at.
+fn collect_bin_artifacts(stdout: &[u8]) -> Vec<(String, String)> {
+    collect_bin_artifacts_detailed(stdout).0
+}
+
+/// The subset of a `compiler-artifact` message this tool reads. Everything
+/// absent or of the wrong shape makes the line fail to parse — which is how a
+/// non-JSON line (cargo forwards raw build-script stdout) is skipped rather than
+/// guessed at.
+///
+/// The fields are **owned**, not borrowed, and that is load-bearing: a borrowed
+/// `&str` can only be deserialized from a JSON string that needs no unescaping.
+/// On Windows the executable path is `D:\a\...`, which appears in the JSON as
+/// `"D:\\a\\..."` — an escape — so a borrowed reader rejects the *entire* message
+/// and every build looks like it "reported no executable artifact". unix paths
+/// contain no escapes, so the bug was invisible there: five integration tests
+/// failed on windows-latest from 2026-10-09 to 2026-10-20 while unix stayed green.
 #[derive(serde::Deserialize)]
-struct ArtifactMsg<'a> {
-    reason: &'a str,
-    executable: Option<&'a str>,
-    target: Option<ArtifactTarget<'a>>,
+struct ArtifactMsg {
+    reason: String,
+    executable: Option<String>,
+    target: Option<ArtifactTarget>,
 }
 
 #[derive(serde::Deserialize)]
-struct ArtifactTarget<'a> {
-    name: Option<&'a str>,
+struct ArtifactTarget {
+    name: Option<String>,
     #[serde(default)]
-    kind: Vec<&'a str>,
+    kind: Vec<String>,
 }
 
 /// `rustc -vV`, reduced to the two facts a plan should record.
@@ -537,6 +568,39 @@ mod tests {
         );
         let got = collect_bin_artifacts(stdout.as_bytes());
         assert_eq!(got, vec![("mytool".to_string(), "/tmp/real".to_string())]);
+    }
+
+    #[test]
+    fn a_windows_path_in_the_artifact_message_is_read_not_dropped() {
+        // cargo emits the executable path as a JSON string, so on Windows every
+        // separator is an escape (`D\\a\\...`). `String`/`&str` borrowed
+        // deserialization cannot borrow a string that needs unescaping, so a
+        // borrowed reader rejects the *whole* message and the build then looks
+        // like "succeeded but reported no executable artifact" — which is exactly
+        // how five integration tests failed on windows-latest (2026-10-09 ..
+        // 2026-10-20) while passing on unix, where paths contain no escapes.
+        let line = r#"{"reason":"compiler-artifact","target":{"name":"tiny","kind":["bin"]},"executable":"D:\\a\\rustopt\\target\\release\\tiny.exe"}"#;
+        let got = collect_bin_artifacts(line.as_bytes());
+        assert_eq!(
+            got,
+            vec![(
+                "tiny".to_string(),
+                r"D:\a\rustopt\target\release\tiny.exe".to_string()
+            )],
+            "a backslash-escaped path must survive parsing"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_artifact_line_is_counted_not_silently_dropped() {
+        // The counterpart of the Windows-path bug: when an artifact-looking line
+        // cannot be parsed, the count must survive so the caller can say "rustopt
+        // could not read cargo" instead of "the build reported nothing".
+        let stdout =
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":\"bin\"},\"executable\":3}\n";
+        let (found, unparsed) = collect_bin_artifacts_detailed(stdout.as_bytes());
+        assert!(found.is_empty());
+        assert_eq!(unparsed, 1, "a malformed artifact line must be counted");
     }
 
     #[test]
